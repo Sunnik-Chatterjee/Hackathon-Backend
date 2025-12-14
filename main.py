@@ -192,12 +192,11 @@ def predict_delay_api(input_json):
         })
 
     return {
-        "route": f"{origin} → {dest}",
-        "departure": input_json["scheduled_dep"],
-        "top_airlines": airlines,
-        "predictions": predictions,
-        "total_flights_for_route": int(route_rows.shape[0])
-    }
+    "origin": origin,
+    "destination": dest,
+    "predictions": predictions
+}
+
 
 
 # =====================================================
