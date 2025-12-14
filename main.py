@@ -1,96 +1,218 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 import pandas as pd
-import joblib
-from datetime import datetime
-from pathlib import Path
 import numpy as np
+import joblib
+from fastapi import FastAPI
+from pydantic import BaseModel
 
-app = FastAPI()
+# =====================================================
+# APP
+# =====================================================
+app = FastAPI(title="Flight Delay Prediction API")
 
-# Load model & dataset
-BASE_DIR = Path(__file__).resolve().parent
-model = joblib.load(BASE_DIR / "best_rf_model.pkl")
-df = pd.read_csv(BASE_DIR / "flights_full.csv", parse_dates=["scheduled_dep"])
+# =====================================================
+# PATHS
+# =====================================================
+DATA_PATH = "flights_full.csv"
+MODEL_PATH = "best_rf_model.pkl"
 
-class UserInput(BaseModel):
+# =====================================================
+# LOAD MODEL FIRST (IMPORTANT)
+# =====================================================
+model = joblib.load(MODEL_PATH)
+
+# =====================================================
+# LOAD & NORMALIZE DATASET
+# =====================================================
+def normalize_delay_column(df):
+    candidates = [
+        "delayminutes", "delay_minutes", "delay_min",
+        "dep_delay", "arr_delay", "arrival_delay"
+    ]
+    for col in candidates:
+        if col in df.columns:
+            df["delayminutes"] = df[col]
+            return df
+    raise ValueError(f"No delay column found. Columns: {list(df.columns)}")
+
+
+df = pd.read_csv(DATA_PATH)
+df = normalize_delay_column(df)
+
+# ---------------- SANITY CHECK ----------------
+required_cols = {
+    "airline", "origin", "destination",
+    "scheduled_dep", "distance_km",
+    "scheduled_duration_min", "delayminutes"
+}
+missing = required_cols - set(df.columns)
+if missing:
+    raise ValueError(f"Dataset missing columns: {missing}")
+
+df["scheduled_dep"] = pd.to_datetime(df["scheduled_dep"])
+df["hour"] = df["scheduled_dep"].dt.hour
+df["weekday"] = df["scheduled_dep"].dt.weekday
+df["is_sunday"] = (df["weekday"] == 6).astype(int)
+
+# =====================================================
+# STATISTICS (FOR CALIBRATION / FALLBACK)
+# =====================================================
+route_airline_stats = (
+    df.groupby(["origin", "destination", "airline"])["delayminutes"]
+    .mean()
+    .to_dict()
+)
+airline_stats = df.groupby("airline")["delayminutes"].mean().to_dict()
+route_stats = df.groupby(["origin", "destination"])["delayminutes"].mean().to_dict()
+GLOBAL_MEAN_DELAY = df["delayminutes"].mean()
+
+# =====================================================
+# HELPERS
+# =====================================================
+def resolve_airline_delay(origin, dest, airline):
+    if (origin, dest, airline) in route_airline_stats:
+        return route_airline_stats[(origin, dest, airline)]
+    if airline in airline_stats:
+        return airline_stats[airline]
+    if (origin, dest) in route_stats:
+        return route_stats[(origin, dest)]
+    return GLOBAL_MEAN_DELAY
+
+
+def route_baseline(origin, dest):
+    return route_stats.get((origin, dest), GLOBAL_MEAN_DELAY)
+
+
+def smooth_delay(raw, baseline):
+    return 0.65 * raw + 0.35 * baseline
+
+
+def estimate_duration(distance):
+    return int(distance / 10)
+
+
+# =====================================================
+# FEATURE VECTOR BUILDER (CRITICAL FIX)
+# =====================================================
+def build_feature_vector(origin, dest, airline, dep_time, distance):
+    X = pd.DataFrame(
+        0,
+        index=[0],
+        columns=model.feature_names_in_
+    )
+
+    # numeric features
+    for col, val in {
+        "distance_km": distance,
+        "hour": dep_time.hour,
+        "is_sunday": int(dep_time.weekday() == 6)
+    }.items():
+        if col in X.columns:
+            X.at[0, col] = val
+
+    # one-hot encoded categorical features
+    for col in [
+        f"airline_{airline}",
+        f"origin_{origin}",
+        f"destination_{dest}"
+    ]:
+        if col in X.columns:
+            X.at[0, col] = 1
+
+    return X
+
+
+# =====================================================
+# INPUT SCHEMA
+# =====================================================
+class FlightInput(BaseModel):
     origin: str
     destination: str
     scheduled_dep: str
 
-def autofill_fields(origin, destination):
-    route_df = df[(df["origin"] == origin) & (df["destination"] == destination)]
-    if len(route_df) == 0:
-        raise HTTPException(status_code=404, detail="Route not found in dataset.")
-    
-    return {
-        "airline": route_df["airline"].mode()[0],
-        "distance_km": int(route_df["distance_km"].mean()),
-        "scheduled_duration_min": int(route_df["scheduled_duration_min"].mean()),
-        "weather": route_df["weather"].mode()[0],
-        "origin_traffic": route_df["origin_traffic"].mode()[0],
-        "dest_traffic": route_df["dest_traffic"].mode()[0]
-    }
 
-@app.post("/predict", operation_id="flight_delay_predict")  # ✅ Unique ID
-@app.post("/predict", operation_id="flight_delay_predict")
-def predict(data: UserInput):
-    origin = data.origin.upper()
-    destination = data.destination.upper()
-    scheduled_dep = data.scheduled_dep
-    
-    try:
-        dt = datetime.strptime(scheduled_dep, "%Y-%m-%d %H:%M")
-    except:
-        raise HTTPException(status_code=400, detail="scheduled_dep must be 'YYYY-MM-DD HH:MM'")
-    
-    route_df = df[(df["origin"] == origin) & (df["destination"] == destination)]
-    if len(route_df) == 0:
-        raise HTTPException(status_code=404, detail="Route not found in dataset.")
-    
-    # ✅ TOP 5 Airlines for this route
-    top_airlines = route_df["airline"].value_counts().head(5).index.tolist()
-    
+# =====================================================
+# PREDICTION LOGIC
+# =====================================================
+def predict_delay_api(input_json):
+    origin = input_json["origin"]
+    dest = input_json["destination"]
+    dep_time = pd.to_datetime(input_json["scheduled_dep"])
+
+    route_rows = df[(df["origin"] == origin) & (df["destination"] == dest)]
+    distance = (
+        route_rows["distance_km"].mean()
+        if not route_rows.empty
+        else df["distance_km"].mean()
+    )
+
+    baseline = route_baseline(origin, dest)
     predictions = []
-    for airline in top_airlines:
-        # Autofill for this specific airline
-        auto = {
-            "airline": airline,
-            "distance_km": int(route_df[route_df["airline"] == airline]["distance_km"].mean()),
-            "scheduled_duration_min": int(route_df[route_df["airline"] == airline]["scheduled_duration_min"].mean()),
-            "weather": route_df["weather"].mode()[0],
-            "origin_traffic": route_df["origin_traffic"].mode()[0],
-            "dest_traffic": route_df["dest_traffic"].mode()[0]
-        }
-        
-        # One-hot encode (same as before)
-        input_data = {
-            'airline': airline, 'origin': origin, 'destination': destination,
-            'scheduled_dep': scheduled_dep, 'scheduled_duration_min': auto["scheduled_duration_min"],
-            'distance_km': auto["distance_km"], 'weather': auto["weather"],
-            'origin_traffic': auto["origin_traffic"], 'dest_traffic': auto["dest_traffic"],
-            'dayofweek': dt.weekday(), 'hourofday': dt.hour
-        }
-        
-        df_input = pd.DataFrame([input_data])
-        categoricals = ['airline', 'origin', 'destination', 'weather', 'origin_traffic', 'dest_traffic']
-        for col in categoricals:
-            dummies = pd.get_dummies(df_input[col], prefix=col).astype(int)
-            df_input = pd.concat([df_input.drop(col, axis=1), dummies], axis=1)
-        
-        df_input = df_input.reindex(columns=model.feature_names_in_, fill_value=0)
-        pred = model.predict(df_input)[0]
-        is_delayed = "Delayed" if pred > 15 else "On Time"
-        
+
+    airlines = sorted(df["airline"].unique())
+
+    for airline in airlines:
+        X_input = build_feature_vector(
+            origin=origin,
+            dest=dest,
+            airline=airline,
+            dep_time=dep_time,
+            distance=distance
+        )
+
+        # handle fully unseen combinations safely
+        if X_input.sum(axis=1).iloc[0] == 0:
+            raw_delay = GLOBAL_MEAN_DELAY
+        else:
+            raw_delay = model.predict(X_input)[0]
+
+        final_delay = smooth_delay(raw_delay, baseline)
+
+        # time-of-day correction
+        if dep_time.hour < 7:
+            final_delay -= 3
+        elif dep_time.hour > 18:
+            final_delay += 4
+
+        final_delay = max(0, final_delay)
+        delay_prob = min(95, max(5, final_delay * 1.7))
+
         predictions.append({
             "airline": airline,
-            "prediction": is_delayed,
-            "predicted_delay_minutes": round(float(pred), 1),
-            "autofilled_data": auto
+            "prediction": "Delayed" if final_delay > 15 else "On Time",
+            "predicted_delay_minutes": round(final_delay, 1),
+            "delay_probability_percent": round(delay_prob, 1),
+            "autofilled_data": {
+                "airline": airline,
+                "distance_km": int(distance),
+                "scheduled_duration_min": estimate_duration(distance),
+                "weather": "Clear",
+                "origin_traffic": "Moderate",
+                "dest_traffic": "Moderate"
+            }
         })
-    
+
     return {
-        "route": f"{origin} → {destination}",
-        "top_airlines": top_airlines,
-        "predictions": predictions
+        "route": f"{origin} → {dest}",
+        "departure": input_json["scheduled_dep"],
+        "top_airlines": airlines,
+        "predictions": predictions,
+        "total_flights_for_route": int(route_rows.shape[0])
+    }
+
+
+# =====================================================
+# ENDPOINTS
+# =====================================================
+@app.post("/predict")
+def predict(input_data: FlightInput):
+    return predict_delay_api(input_data.dict())
+
+
+@app.get("/")
+def root():
+    return {
+        "message": "Flight Delay Prediction API (FIXED)",
+        "total_records": len(df),
+        "routes": df[["origin", "destination"]].drop_duplicates().shape[0],
+        "airlines": sorted(df["airline"].unique())
     }
